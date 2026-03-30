@@ -1,0 +1,152 @@
+name: RabbitSync — auto-update We Are One 10 Billion projects
+
+# RABBITSYNC AUTO ALL
+# Listens for repository_dispatch events published by upstream projects
+# (PATPAT, WEAREONE10BILLION, MANUSWEAREONE10BILLION) and also polls on a
+# schedule, mirroring the RabbitMQ pub/sub contract in GitHub Actions.
+
+on:
+  # Event-driven trigger (RABBITSYNC): upstream repos call the GitHub API
+  # with client_payload.project set to one of the registered project slugs.
+  repository_dispatch:
+    types:
+      - patpat-sync
+      - weareone10billion-sync
+      - manusweareone10billion-sync
+      - rabbitsync-all
+
+  # Schedule-based trigger (AUTO ALL): run every 6 hours for all projects.
+  schedule:
+    - cron: '0 */6 * * *'
+
+  # Manual trigger for ad-hoc runs.
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project to sync (leave blank for ALL)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - patpat
+          - weareone10billion
+          - manusweareone10billion
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rabbit-sync:
+    name: Sync ${{ github.event.inputs.project || github.event.action || 'all' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Determine sync targets
+        id: targets
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          INPUT_PROJECT: ${{ github.event.inputs.project }}
+        run: |
+          if [ -n "$INPUT_PROJECT" ] && [ "$INPUT_PROJECT" != "all" ]; then
+            echo "projects=$INPUT_PROJECT" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_ACTION" = "patpat-sync" ]; then
+            echo "projects=patpat" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_ACTION" = "weareone10billion-sync" ]; then
+            echo "projects=weareone10billion" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_ACTION" = "manusweareone10billion-sync" ]; then
+            echo "projects=manusweareone10billion" >> "$GITHUB_OUTPUT"
+          else
+            # AUTO ALL
+            echo "projects=patpat,weareone10billion,manusweareone10billion" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run RabbitSync
+        id: sync
+        env:
+          SYNC_PROJECTS: ${{ steps.targets.outputs.projects }}
+          DISPATCH_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          python - <<'EOF'
+          import asyncio
+          import json
+          import os
+          import sys
+
+          # Adjust path so v1/src is importable.
+          sys.path.insert(0, "v1")
+
+          from src.tasks.sync import (
+              RabbitSyncTask,
+              SyncEvent,
+              SyncProject,
+          )
+
+          async def main():
+              projects_env = os.environ.get("SYNC_PROJECTS", "")
+              payload_env = os.environ.get("DISPATCH_PAYLOAD", "{}")
+
+              try:
+                  payload = json.loads(payload_env) if payload_env else {}
+              except json.JSONDecodeError:
+                  payload = {}
+
+              task = RabbitSyncTask(auto=True)
+
+              if projects_env and projects_env != "all":
+                  slugs = [s.strip() for s in projects_env.split(",") if s.strip()]
+                  targets = []
+                  for slug in slugs:
+                      try:
+                          targets.append(SyncProject(slug))
+                      except ValueError:
+                          print(f"WARNING: unknown project slug '{slug}', skipping")
+              else:
+                  targets = list(SyncProject)
+
+              for project in targets:
+                  event_type = "repository_dispatch" if payload else "auto_poll"
+                  await task.publish(
+                      SyncEvent(
+                          project=project,
+                          event_type=event_type,
+                          payload=payload or {"source": "rabbitsync_auto"},
+                      )
+                  )
+
+              result = await task.run_once(projects=targets if targets else None)
+              print(json.dumps(result, indent=2))
+              if result.get("events_processed", 0) == 0 and not task.auto:
+                  sys.exit(1)
+
+          asyncio.run(main())
+          EOF
+
+      - name: Report sync summary
+        if: always()
+        run: |
+          echo "### RabbitSync completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Trigger | ${{ github.event_name }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Projects | ${{ steps.targets.outputs.projects }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Run | ${{ github.run_number }} |" >> "$GITHUB_STEP_SUMMARY"
